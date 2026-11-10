@@ -25,7 +25,9 @@ defmodule Bypass.Instance do
 
   def init([opts]) do
     # Get a free port from the OS
-    case :ranch_tcp.listen(so_reuseport() ++ [ip: listen_ip(), port: Keyword.get(opts, :port, 0)]) do
+    case :ranch_tcp.listen(%{
+           socket_opts: so_reuseport() ++ [ip: listen_ip(), port: Keyword.get(opts, :port, 0)]
+         }) do
       {:ok, socket} ->
         {:ok, port} = :inet.port(socket)
         :erlang.port_close(socket)
@@ -317,12 +319,18 @@ defmodule Bypass.Instance do
 
   defp match_route(_, _), do: {false, nil}
 
+  # Ranch 2 no longer accepts an already-open listen socket, so Ranch opens it
+  # and hands it back through `post_listen_callback`. The callback runs while
+  # `Plug.Cowboy.http/3` is starting the listener, so the message is in the
+  # mailbox by the time it returns. Bypass keeps the socket to close it
+  # synchronously in `do_down/2`.
   defp do_up(port, ref) do
     plug_opts = [self()]
-    {:ok, socket} = :ranch_tcp.listen(so_reuseport() ++ [ip: listen_ip(), port: port])
-    cowboy_opts = cowboy_opts(port, ref, socket)
-    {:ok, _pid} = Plug.Cowboy.http(Bypass.Plug, plug_opts, cowboy_opts)
-    socket
+    {:ok, _pid} = Plug.Cowboy.http(Bypass.Plug, plug_opts, cowboy_opts(port, ref, self()))
+
+    receive do
+      {:bypass_listen_socket, ^ref, socket} -> socket
+    end
   end
 
   defp do_down(ref, socket) do
@@ -417,8 +425,20 @@ defmodule Bypass.Instance do
     new_route(fun, build_path_match(path) |> elem(1), expected)
   end
 
-  defp cowboy_opts(port, ref, socket) do
-    [ref: ref, port: port, transport_options: [num_acceptors: 5, socket: socket]]
+  defp cowboy_opts(port, ref, owner) do
+    [
+      ref: ref,
+      port: port,
+      ip: listen_ip(),
+      transport_options: [
+        num_acceptors: 5,
+        socket_opts: so_reuseport(),
+        post_listen_callback: fn socket ->
+          send(owner, {:bypass_listen_socket, ref, socket})
+          :ok
+        end
+      ]
+    ]
   end
 
   # Use raw socket options to set SO_REUSEPORT so we fix {:error, :eaddrinuse} - where the OS errors
